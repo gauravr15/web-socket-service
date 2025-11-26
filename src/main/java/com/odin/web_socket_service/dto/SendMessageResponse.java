@@ -26,4 +26,14 @@ public class SendMessageResponse {
 	private Object file;
 	private Long timestamp;
     private String senderName;
+    
+    private String messageType;   // chat, call-offer, call-answer, ice, call-end
+    private String sdp;           // SDP for offer/answer
+    private String candidate;     // ICE candidate JSON
+    private String callId;
+    
+    private String eventType;   // CALL_INITIATE, OFFER, ANSWER, ICE, CALL_END, etc.
+
+    private Boolean videoCall;  // audio / video
+
 }

@@ -2,6 +2,7 @@ package com.odin.web_socket_service.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.odin.web_socket_service.dto.CallSession;
 import com.odin.web_socket_service.dto.NotificationDTO;
 import com.odin.web_socket_service.dto.Profile;
 import com.odin.web_socket_service.dto.SendMessageRequest;
@@ -35,6 +36,7 @@ public class MessageService {
 	private final ObjectMapper objectMapper = new ObjectMapper();
 	private final MessageRelayService messageRelayService;
 	private final SessionRegistryService sessionRegistryService;
+	private final CallSessionRegistryService callSessionRegistryService;
 	private final ConnectionRegistryService connectionRegistryService;
 	private final NotificationUtility notification;
 	private final ProfileRepository profileRepo;
@@ -42,13 +44,15 @@ public class MessageService {
 
 	public MessageService(MessageRelayService messageRelayService, SessionRegistryService sessionRegistryService,
 			ConnectionRegistryService connectionRegistryService, NotificationUtility notification,
-			ProfileRepository profileRepo, CacheManager cacheManager) {
+			ProfileRepository profileRepo, CacheManager cacheManager,
+			CallSessionRegistryService callSessionRegistryService) {
 		this.messageRelayService = messageRelayService;
 		this.sessionRegistryService = sessionRegistryService;
 		this.connectionRegistryService = connectionRegistryService;
 		this.notification = notification;
 		this.profileRepo = profileRepo;
 		this.cacheManager = cacheManager;
+		this.callSessionRegistryService = callSessionRegistryService;
 	}
 
 	// small LRU for hash lookups (simple in-memory LRU)
@@ -64,6 +68,31 @@ public class MessageService {
 	 */
 	public void handleIncomingMessage(WebSocketSession session, WebSocketMessage<?> message) throws IOException {
 		// Parse incoming payload into SendMessageRequest DTO
+		log.info("Incoming WS message payload: {}",
+				message.getPayload() != null ? message.getPayload().toString() : "null");
+		JsonNode root = objectMapper.readTree(message.getPayload().toString());
+
+		// 1) WebRTC signaling messages come this way:
+		if (root.has("signal")) {
+			String signal = root.get("signal").asText();
+
+			switch (signal) {
+			case "CALL_OFFER":
+			case "CALL_ANSWER":
+			case "ICE_CANDIDATE":
+			case "CALL_END":
+			case "CALL_RINGING":
+			case "CALL_REJECT":
+			case "CALL_CONNECTED":
+			case "CALL_BUSY":
+			case "CALL_TIMEOUT":
+			case "CALL_RENEGOTIATE":
+			case "CALL_PARTICIPANT_ADD":
+			case "CALL_PARTICIPANT_REMOVE":
+				handleSignalWithProfile(signal, root);
+				return;
+			}
+		}
 		SendMessageRequest request = objectMapper.readValue(message.getPayload().toString(), SendMessageRequest.class);
 
 		String senderId = request.getSenderId();
@@ -76,20 +105,17 @@ public class MessageService {
 			log.warn("Missing senderId or receiverId in incoming payload: {}", message.getPayload().toString());
 			return;
 		}
-
 		// Hash user identifiers globally (deterministic, same across receivers)
 		String hashedSenderId = hashUserIdentifier(senderId);
-//		String hashedReceiverId = hashUserIdentifier(receiverId);
-
 		Profile sender = getOrLoadProfile(hashedSenderId, senderId);
-//		Profile receiver = getOrLoadProfile(hashedReceiverId, receiverId);
 
 		if (sender == null) {
 			log.warn("Sender or Receiver not found for message {} → {}", senderId, receiverId);
 			return;
 		}
 
-		if (sampleMessage != null) {
+		// Existing chat flow (unchanged)
+		if (sampleMessage != null && !sampleMessage.isEmpty()) {
 			Map<String, String> map = new HashMap<>();
 			map.put("sampleMessage", sampleMessage);
 			NotificationDTO notify = NotificationDTO.builder()
@@ -102,21 +128,46 @@ public class MessageService {
 			WebSocketSession targetSession = sessionRegistryService.getSession(receiverId);
 
 			// Wrap outbound into SendMessageResponse DTO
-			SendMessageResponse response = SendMessageResponse.builder().senderMobile(sender.getMobile()).receiverId(receiverId)
-					.messageId(request.getMessageId()).senderId(senderId).delivered(targetSession != null && targetSession.isOpen())
-					.deliveryTimestamp(timestamp).actualMessage(actualMessage).senderName(sender.getFirstName()+" "+sender.getLastName()).isRead(false).build();
+			SendMessageResponse response = SendMessageResponse.builder().senderMobile(sender.getMobile())
+					.receiverId(receiverId).messageId(request.getMessageId()).senderId(senderId)
+					.delivered(targetSession != null && targetSession.isOpen()).deliveryTimestamp(timestamp)
+					.actualMessage(actualMessage).senderName(sender.getFirstName() + " " + sender.getLastName())
+					.isRead(false).messageType("chat").timestamp(timestamp).build();
 
 			String outboundJson = objectMapper.writeValueAsString(response);
+			log.info("Outbound signaling JSON [{} → {}]: {}", senderId != null ? senderId : "null",
+					receiverId != null ? receiverId : "null", outboundJson != null ? outboundJson : "null");
 
 			if (targetSession != null && targetSession.isOpen()) {
 				targetSession.sendMessage(new TextMessage(outboundJson));
 				log.info("Forwarded message from {} → {} (cached sender): {}", senderId, receiverId, actualMessage);
 			} else {
-				messageRelayService.publish(senderId, receiverId, actualMessage);
+				// publish JSON so other pods will deliver whole message
+				messageRelayService.publish(senderId, receiverId, outboundJson);
 				log.info("Receiver {} not local; published via Redis", receiverId);
 			}
 		} else {
 			log.warn("Invalid message payload from {}: {}", senderId, message.getPayload().toString());
+		}
+	}
+
+	/**
+	 * Small helper that serializes response and either sends to local session or
+	 * publishes to Redis so other pods receive the whole signaling payload.
+	 */
+	private void forwardOrPublishSignal(String senderId, String receiverId, SendMessageResponse resp)
+			throws IOException {
+		String outboundJson = objectMapper.writeValueAsString(resp);
+		WebSocketSession targetSession = sessionRegistryService.getSession(receiverId);
+
+		if (targetSession != null && targetSession.isOpen()) {
+			targetSession.sendMessage(new TextMessage(outboundJson));
+			log.info("Forwarded signaling {} from {} → {}", resp.getMessageType(), senderId, receiverId);
+		} else {
+			// publish JSON so other pod can deliver the full signaling message
+			messageRelayService.publish(senderId, receiverId, outboundJson);
+			log.info("Published signaling {} from {} → {} to Redis (relay)", resp.getMessageType(), senderId,
+					receiverId);
 		}
 	}
 
@@ -239,4 +290,215 @@ public class MessageService {
 			return null;
 		}
 	}
+
+	/*
+	 * ========================================================== FIXED SIGNALING
+	 * HANDLERS ==========================================================
+	 */
+
+	/**
+	 * CALL_OFFER
+	 */
+	private void handleOfferJson(JsonNode root) throws IOException {
+		String from = root.get("from").asText();
+		String to = root.get("to").asText();
+		JsonNode payload = root.get("payload");
+
+		Map<String, Object> resp = new HashMap<>();
+		resp.put("signal", "CALL_OFFER");
+		resp.put("from", from);
+		resp.put("to", to);
+		resp.put("payload", payload);
+
+		sendSignalJson(resp, from, to);
+	}
+
+	private void handleAnswerJson(JsonNode root) throws IOException {
+		String from = root.get("from").asText();
+		String to = root.get("to").asText();
+		JsonNode payload = root.get("payload");
+
+		Map<String, Object> resp = new HashMap<>();
+		resp.put("signal", "CALL_ANSWER");
+		resp.put("from", from);
+		resp.put("to", to);
+		resp.put("payload", payload);
+
+		sendSignalJson(resp, from, to);
+	}
+
+	private void handleIceJson(JsonNode root) throws IOException {
+		String from = root.get("from").asText();
+		String to = root.get("to").asText();
+		JsonNode payload = root.get("payload");
+
+		Map<String, Object> resp = new HashMap<>();
+		resp.put("signal", "ICE_CANDIDATE");
+		resp.put("from", from);
+		resp.put("to", to);
+		resp.put("payload", payload);
+
+		sendSignalJson(resp, from, to);
+	}
+
+	private void handleCallEndJson(JsonNode root) throws IOException {
+		String from = root.get("from").asText();
+		String to = root.get("to").asText();
+		JsonNode payload = root.get("payload");
+
+		Map<String, Object> resp = new HashMap<>();
+		resp.put("signal", "CALL_END");
+		resp.put("from", from);
+		resp.put("to", to);
+		resp.put("payload", payload);
+
+		sendSignalJson(resp, from, to);
+	}
+
+	/*
+	 * ========================================================== SHARED SENDER —
+	 * forwards JSON safely to FE (or Redis)
+	 * ==========================================================
+	 */
+	private void sendSignalJson(Map<String, Object> resp, String senderId, String receiverId) throws IOException {
+		String json = objectMapper.writeValueAsString(resp);
+
+		WebSocketSession session = sessionRegistryService.getSession(receiverId);
+		if (session != null && session.isOpen()) {
+			session.sendMessage(new TextMessage(json));
+			log.warn("SIGNAL SENT (LOCAL) {} → {} | {}", senderId, receiverId, resp.get("signal"));
+		} else {
+			messageRelayService.publish(senderId, receiverId, json);
+			log.warn("SIGNAL SENT (REDIS) {} → {} | {}", senderId, receiverId, resp.get("signal"));
+		}
+	}
+
+	private void handleSignalWithProfile(String signalType, JsonNode root) throws IOException {
+
+		final String from = root.path("from").asText(null);
+		final String to = root.path("to").asText(null);
+		final JsonNode payload = root.path("payload");
+
+		final String sessionId = root.path("sessionId").asText(null);
+		final String callType = root.path("callType").asText(null);
+
+		// --- profile details ---
+		Profile sender = null;
+		if (from != null) {
+			String hashed = hashUserIdentifier(from);
+			sender = getOrLoadProfile(hashed, from);
+		}
+
+		// --- base response ---
+		Map<String, Object> resp = new HashMap<>();
+		resp.put("signal", signalType);
+		resp.put("from", from);
+		resp.put("to", to);
+		if (payload != null && !payload.isMissingNode()) {
+			resp.put("payload", payload);
+		}
+		if (sessionId != null)
+			resp.put("sessionId", sessionId);
+		if (callType != null)
+			resp.put("callType", callType);
+
+		if (sender != null) {
+			resp.put("senderMobile", sender.getMobile());
+			resp.put("senderName", sender.getFirstName() + " " + sender.getLastName());
+		}
+
+		// --- SESSION HANDLING ---
+		CallSession session = (sessionId != null) ? callSessionRegistryService.getSession(sessionId) : null;
+
+		switch (signalType) {
+
+		case "CALL_OFFER":
+			session = callSessionRegistryService.createSession(sessionId, callType, from, to);
+			session.setCurrentState("OFFERED");
+			break;
+
+		case "CALL_RINGING":
+			safeUpdateState(session, sessionId, "RINGING");
+			break;
+
+		case "CALL_ANSWER":
+			safeUpdateState(session, sessionId, "ANSWERED");
+			break;
+
+		case "CALL_CONNECTED":
+			if (safeUpdateState(session, sessionId, "CONNECTED")) {
+				resp.put("state", "CONNECTED");
+				resp.put("participants", session.getParticipants());
+				resp.put("callType", session.getCallType());
+			}
+			break;
+
+		case "CALL_RENEGOTIATE":
+			if (!safeExists(session, sessionId))
+				return;
+			session.setCurrentState("RENEGOTIATING");
+			resp.put("state", "RENEGOTIATING");
+			resp.put("participants", session.getParticipants());
+			resp.put("callType", session.getCallType());
+			resp.put("renegotiate", true);
+			break;
+
+		case "CALL_REJECT":
+			if (safeUpdateState(session, sessionId, "REJECTED")) {
+		        resp.put("state", "REJECTED");
+		    }
+			callSessionRegistryService.markForCleanup(sessionId);
+			break;
+
+		case "CALL_END":
+			if (safeUpdateState(session, sessionId, "ENDED")) {
+		        resp.put("state", "ENDED");
+		    }
+			callSessionRegistryService.markForCleanup(sessionId);
+			break;
+
+		case "CALL_BUSY":
+			safeUpdateState(session, sessionId, "BUSY");
+			callSessionRegistryService.markForCleanup(sessionId);
+			break;
+
+		case "CALL_TIMEOUT":
+			safeUpdateState(session, sessionId, "TIMEOUT");
+			callSessionRegistryService.markForCleanup(sessionId);
+			break;
+
+		case "CALL_PARTICIPANT_ADD":
+			if (safeExists(session, sessionId) && root.has("newParticipant")) {
+				session.addParticipant(root.get("newParticipant").asText());
+				resp.put("participants", session.getParticipants());
+			}
+			break;
+
+		case "CALL_PARTICIPANT_REMOVE":
+			if (safeExists(session, sessionId) && root.has("userId")) {
+				session.removeParticipant(root.get("userId").asText());
+				resp.put("participants", session.getParticipants());
+			}
+			break;
+		}
+
+		sendSignalJson(resp, from, to);
+	}
+
+	private boolean safeExists(CallSession s, String sessionId) {
+		if (s == null) {
+			log.warn("Signal received but session does NOT exist: {}", sessionId);
+			return false;
+		}
+		return true;
+	}
+
+	private boolean safeUpdateState(CallSession session, String sessionId, String state) {
+		if (!safeExists(session, sessionId))
+			return false;
+		callSessionRegistryService.updateState(sessionId, state);
+		session.setCurrentState(state);
+		return true;
+	}
+
 }
