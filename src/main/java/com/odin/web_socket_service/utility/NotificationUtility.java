@@ -15,10 +15,10 @@ public class NotificationUtility {
     private static final String TOPIC = "sample-message-topic";
 
     @Autowired
-    private KafkaTemplate<String, NotificationDTO> kafkaTemplate;
+    private KafkaTemplate<String, NotificationDTO> notificationDTOKafkaTemplate;
 
     public void sendOtpMessage(NotificationDTO message) {
         log.info("Producing message to Kafka: {}", message);
-        kafkaTemplate.send(TOPIC, message);
+        notificationDTOKafkaTemplate.send(TOPIC, message);
     }
 }

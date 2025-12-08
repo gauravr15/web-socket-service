@@ -2,9 +2,11 @@ package com.odin.web_socket_service.controller;
 
 import com.odin.web_socket_service.dto.SendMessageRequest;
 import com.odin.web_socket_service.dto.SendMessageResponse;
+import com.odin.web_socket_service.dto.UndeliveredMessagesResponse;
 import com.odin.web_socket_service.dto.UserStatusResponse;
 import com.odin.web_socket_service.service.ConnectionRegistryService;
 import com.odin.web_socket_service.service.MessageService;
+import com.odin.web_socket_service.service.OfflineMessageService;
 import com.odin.web_socket_service.utility.JwtUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
@@ -13,6 +15,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.util.List;
+
 @Slf4j
 @RestController
 @RequestMapping("/v1/websocket")
@@ -20,13 +24,16 @@ public class MessageController {
 
     private final MessageService messageService;
     private final ConnectionRegistryService connectionRegistryService;
+    private final OfflineMessageService offlineMessageService;
     private final JwtUtil jwtUtil;
 
     public MessageController(MessageService messageService,
                              ConnectionRegistryService connectionRegistryService,
+                             OfflineMessageService offlineMessageService,
                              JwtUtil jwtUtil) {
         this.messageService = messageService;
         this.connectionRegistryService = connectionRegistryService;
+        this.offlineMessageService = offlineMessageService;
         this.jwtUtil = jwtUtil;
     }
 
@@ -89,7 +96,59 @@ public class MessageController {
             return new ResponseEntity<>("Delivered or relayed", HttpStatus.OK);
         } else {
             log.warn("sendMessage: failed to deliver {} → {}", fromUserId, targetUserId);
-            return new ResponseEntity("Delivery failed", HttpStatus.CONFLICT);
+            return new ResponseEntity<>("Delivery failed", HttpStatus.CONFLICT);
+        }
+    }
+
+    /**
+     * GET /v1/websocket/get-undelivered-message
+     * Retrieves all undelivered messages for a user from Redis.
+     * Requires Authorization Bearer <token> header. UserId is determined from JWT.
+     * 
+     * Returns:
+     * - 200 OK with list of undelivered messages
+     * - 401 UNAUTHORIZED if token is invalid
+     */
+    @GetMapping("/get-undelivered-message")
+    public ResponseEntity<UndeliveredMessagesResponse> getUndeliveredMessages(
+            @RequestHeader HttpHeaders headers
+    ) {
+        String authHeader = headers.getFirst(HttpHeaders.AUTHORIZATION);
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            log.warn("getUndeliveredMessages: missing or invalid Authorization header");
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Missing Authorization");
+        }
+
+        String token = authHeader.substring("Bearer ".length()).trim();
+        if (!jwtUtil.validateToken(token)) {
+            log.warn("getUndeliveredMessages: invalid token provided");
+            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "Invalid token");
+        }
+
+        String userId = jwtUtil.getUserId(token);
+        log.info("getUndeliveredMessages called for userId={}", userId);
+
+        try {
+            List<SendMessageResponse> messages = offlineMessageService.getUndeliveredMessages(userId);
+            
+            UndeliveredMessagesResponse response = UndeliveredMessagesResponse.builder()
+                    .messages(messages)
+                    .totalCount(messages.size())
+                    .hasMessages(!messages.isEmpty())
+                    .build();
+
+            log.info("Retrieved {} undelivered messages for userId={}", messages.size(), userId);
+            
+            // Delete messages after retrieval (they have been delivered to frontend)
+            if (!messages.isEmpty()) {
+                offlineMessageService.deleteUndeliveredMessages(userId);
+                log.info("Deleted retrieved undelivered messages for userId={}", userId);
+            }
+
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("Failed to get undelivered messages for userId={}: {}", userId, e.getMessage(), e);
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to retrieve undelivered messages");
         }
     }
 }

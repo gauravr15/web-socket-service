@@ -5,7 +5,6 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
-import java.time.Duration;
 import java.util.Optional;
 
 @Slf4j
@@ -17,32 +16,46 @@ public class ConnectionRegistryService {
     @Value("${pod.name:dev}")  // Default to "dev" if environment variable not set
     private String podName;
 
+    @Value("${connection.registry.ttl.seconds:30}")  // Default to 30 seconds (for informational logging only)
+    private long connectionTtlSeconds;
+
     public ConnectionRegistryService(StringRedisTemplate redisTemplate) {
         this.redisTemplate = redisTemplate;
     }
 
+    /**
+     * Register a connection for the given user.
+     * Entry persists until explicit unregisterConnection() call (on WebSocket disconnect).
+     * No auto-expiry - relies on explicit disconnect to clean up.
+     */
     public void registerConnection(String userId) {
         try {
             String key = registryKey(userId);
-            redisTemplate.opsForValue().set(key, podName, Duration.ofHours(1));
-            log.info("Registered connection for userId='{}' on pod='{}' with TTL=1h", userId, podName);
+            // Store pod name without TTL - entry persists until explicit disconnect
+            redisTemplate.opsForValue().set(key, podName);
+            log.info("Registered connection for userId='{}' on pod='{}' (persists until disconnect)", 
+                    userId, podName);
         } catch (Exception e) {
             log.error("Failed to register connection for userId='{}': {}", userId, e.getMessage(), e);
         }
     }
 
+    /**
+     * Refresh the connection TTL (kept for backward compatibility with ping-pong).
+     * With Option 3 strategy, this is a no-op since entry has no expiry.
+     * Pings can still be used for application-level heartbeat/latency checks.
+     */
     public void refreshConnectionTTL(String userId) {
         try {
             String key = registryKey(userId);
             Boolean exists = redisTemplate.hasKey(key);
             if (Boolean.TRUE.equals(exists)) {
-                redisTemplate.expire(key, Duration.ofHours(1));
-                log.debug("Refreshed TTL for userId='{}'", userId);
+                log.debug("Ping received for userId='{}' (connection entry persists until disconnect)", userId);
             } else {
-                log.debug("Skipping TTL refresh; no redis entry for userId={}", userId);
+                log.debug("Ping received but no redis entry for userId={} - user may have disconnected", userId);
             }
         } catch (Exception e) {
-            log.error("Failed to refresh TTL for userId='{}': {}", userId, e.getMessage(), e);
+            log.error("Failed to refresh connection for userId='{}': {}", userId, e.getMessage(), e);
         }
     }
 

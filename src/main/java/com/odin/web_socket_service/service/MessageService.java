@@ -23,15 +23,28 @@ import org.springframework.web.socket.WebSocketSession;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
+
+import org.springframework.beans.factory.annotation.Value;
 
 @Service
 @Slf4j
 public class MessageService {
+
+	private static class IceBuffer {
+		boolean offerDelivered = false;
+		boolean answerDelivered = false;
+		final List<Map<String, Object>> queuedCandidates = new ArrayList<>();
+	}
+
+	private final Map<String, IceBuffer> iceBufferMap = new ConcurrentHashMap<>();
 
 	private final ObjectMapper objectMapper = new ObjectMapper();
 	private final MessageRelayService messageRelayService;
@@ -41,11 +54,24 @@ public class MessageService {
 	private final NotificationUtility notification;
 	private final ProfileRepository profileRepo;
 	private final CacheManager cacheManager; // Spring CacheManager injected
+	private final OfflineMessageService offlineMessageService;
+	private final KafkaNotificationService kafkaNotificationService;
+
+	@Value("${offline.messaging.enabled:true}")
+	private boolean offlineMessagingEnabled;
+
+	@Value("${offline.message.storage.enabled:true}")
+	private boolean offlineMessageStorageEnabled;
+
+	@Value("${offline.kafka.notifications.enabled:true}")
+	private boolean offlineKafkaNotificationsEnabled;
 
 	public MessageService(MessageRelayService messageRelayService, SessionRegistryService sessionRegistryService,
 			ConnectionRegistryService connectionRegistryService, NotificationUtility notification,
 			ProfileRepository profileRepo, CacheManager cacheManager,
-			CallSessionRegistryService callSessionRegistryService) {
+			CallSessionRegistryService callSessionRegistryService,
+			OfflineMessageService offlineMessageService,
+			KafkaNotificationService kafkaNotificationService) {
 		this.messageRelayService = messageRelayService;
 		this.sessionRegistryService = sessionRegistryService;
 		this.connectionRegistryService = connectionRegistryService;
@@ -53,6 +79,8 @@ public class MessageService {
 		this.profileRepo = profileRepo;
 		this.cacheManager = cacheManager;
 		this.callSessionRegistryService = callSessionRegistryService;
+		this.offlineMessageService = offlineMessageService;
+		this.kafkaNotificationService = kafkaNotificationService;
 	}
 
 	// small LRU for hash lookups (simple in-memory LRU)
@@ -67,33 +95,56 @@ public class MessageService {
 	 * Handles messages received from local WebSocket clients (incoming ws traffic).
 	 */
 	public void handleIncomingMessage(WebSocketSession session, WebSocketMessage<?> message) throws IOException {
-		// Parse incoming payload into SendMessageRequest DTO
-		log.info("Incoming WS message payload: {}",
-				message.getPayload() != null ? message.getPayload().toString() : "null");
-		JsonNode root = objectMapper.readTree(message.getPayload().toString());
+		long serviceEntryTime = System.currentTimeMillis();
+		SendMessageRequest request = null;
+		
+		log.info("[DEBUG-SERVICE-ENTRY] MessageService.handleIncomingMessage() called - sessionId={}, timestamp={}", 
+				session.getId(), serviceEntryTime);
+		
+		try {
+			// Parse incoming payload into SendMessageRequest DTO
+			log.info("[DEBUG-SERVICE-ENTRY] Incoming WS message payload length: {} bytes, timestamp={}",
+					message.getPayload() != null ? message.getPayload().toString().length() : 0,
+					System.currentTimeMillis());
+			
+			JsonNode root = objectMapper.readTree(message.getPayload().toString());
+			log.debug("Parsed JSON root: {}", root.toString());
 
-		// 1) WebRTC signaling messages come this way:
-		if (root.has("signal")) {
-			String signal = root.get("signal").asText();
+			// 1) WebRTC signaling messages come this way:
+			if (root.has("signal")) {
+				String signal = root.get("signal").asText();
 
-			switch (signal) {
-			case "CALL_OFFER":
-			case "CALL_ANSWER":
-			case "ICE_CANDIDATE":
-			case "CALL_END":
-			case "CALL_RINGING":
-			case "CALL_REJECT":
-			case "CALL_CONNECTED":
-			case "CALL_BUSY":
-			case "CALL_TIMEOUT":
-			case "CALL_RENEGOTIATE":
-			case "CALL_PARTICIPANT_ADD":
-			case "CALL_PARTICIPANT_REMOVE":
-				handleSignalWithProfile(signal, root);
-				return;
+				switch (signal) {
+				case "CALL_OFFER":
+				case "CALL_ANSWER":
+				case "ICE_CANDIDATE":
+				case "CALL_END":
+				case "CALL_RINGING":
+				case "CALL_REJECT":
+				case "CALL_CONNECTED":
+				case "CALL_BUSY":
+				case "CALL_TIMEOUT":
+				case "CALL_RENEGOTIATE":
+				case "CALL_PARTICIPANT_ADD":
+				case "CALL_PARTICIPANT_REMOVE":
+					handleSignalWithProfile(signal, root);
+					return;
+				}
 			}
+			request = objectMapper.readValue(message.getPayload().toString(), SendMessageRequest.class);
+			
+			// Log if files are present
+			if (request.getFiles() != null && !request.getFiles().isEmpty()) {
+				log.info("Received message with {} file(s) from sender: {}", 
+						request.getFiles().size(), request.getSenderId());
+			}
+		} catch (com.fasterxml.jackson.core.JsonParseException e) {
+			log.error("JSON parsing error for message from session {}: {}", session.getId(), e.getMessage());
+			throw e;
+		} catch (Exception e) {
+			log.error("Error handling incoming message from session {}: {}", session.getId(), e.getMessage(), e);
+			throw e;
 		}
-		SendMessageRequest request = objectMapper.readValue(message.getPayload().toString(), SendMessageRequest.class);
 
 		String senderId = request.getSenderId();
 		String receiverId = request.getReceiverId();
@@ -114,8 +165,13 @@ public class MessageService {
 			return;
 		}
 
-		// Existing chat flow (unchanged)
-		if (sampleMessage != null && !sampleMessage.isEmpty()) {
+		// Check if there's any content to send (text message OR files)
+		boolean hasActualMessage = actualMessage != null && !actualMessage.isEmpty();
+		boolean hasSampleMessage = sampleMessage != null && !sampleMessage.isEmpty();
+		boolean hasFiles = request.getFiles() != null && !request.getFiles().isEmpty();
+		
+		// Send in-app notification if sample message is present
+		if (hasSampleMessage) {
 			Map<String, String> map = new HashMap<>();
 			map.put("sampleMessage", sampleMessage);
 			NotificationDTO notify = NotificationDTO.builder()
@@ -124,27 +180,52 @@ public class MessageService {
 			notification.sendOtpMessage(notify);
 		}
 
-		if (actualMessage != null) {
+		// Process message if it has actual content (text OR files)
+		if (hasActualMessage || hasFiles) {
 			WebSocketSession targetSession = sessionRegistryService.getSession(receiverId);
 
-			// Wrap outbound into SendMessageResponse DTO
-			SendMessageResponse response = SendMessageResponse.builder().senderMobile(sender.getMobile())
-					.receiverId(receiverId).messageId(request.getMessageId()).senderId(senderId)
-					.delivered(targetSession != null && targetSession.isOpen()).deliveryTimestamp(timestamp)
-					.actualMessage(actualMessage).senderName(sender.getFirstName() + " " + sender.getLastName())
-					.isRead(false).messageType("chat").timestamp(timestamp).build();
+			// Build response with all content: actualMessage, sampleMessage, and files
+			SendMessageResponse response = SendMessageResponse.builder()
+					.senderMobile(sender.getMobile())
+					.receiverId(receiverId)
+					.messageId(request.getMessageId())
+					.senderId(senderId)
+					.delivered(targetSession != null && targetSession.isOpen())
+					.deliveryTimestamp(timestamp)
+					.actualMessage(actualMessage)  // Can be null/empty if only files
+					.senderName(sender.getFirstName() + " " + sender.getLastName())
+					.files(request.getFiles())  // Can be null/empty if only text
+					.isRead(false)
+					.messageType("chat")
+					.timestamp(timestamp)
+					.build();
 
 			String outboundJson = objectMapper.writeValueAsString(response);
-			log.info("Outbound signaling JSON [{} → {}]: {}", senderId != null ? senderId : "null",
-					receiverId != null ? receiverId : "null", outboundJson != null ? outboundJson : "null");
+			
+			// Log message details without exposing full payload (for large files)
+			String logMessage = String.format("Outbound message [%s → %s]: text=%s, files=%d, size=%d bytes",
+					senderId, receiverId, 
+					hasActualMessage ? "yes" : "no",
+					hasFiles ? request.getFiles().size() : 0,
+					outboundJson.length());
+			log.info(logMessage);
 
 			if (targetSession != null && targetSession.isOpen()) {
 				targetSession.sendMessage(new TextMessage(outboundJson));
-				log.info("Forwarded message from {} → {} (cached sender): {}", senderId, receiverId, actualMessage);
+				log.info("Forwarded message from {} → {} (text:{}, files:{})", 
+						senderId, receiverId, hasActualMessage, hasFiles);
 			} else {
-				// publish JSON so other pods will deliver whole message
-				messageRelayService.publish(senderId, receiverId, outboundJson);
-				log.info("Receiver {} not local; published via Redis", receiverId);
+				// Check if receiver is online in Redis
+				boolean receiverOnline = connectionRegistryService.hasConnection(receiverId);
+				if (!receiverOnline) {
+					// Receiver is offline - handle offline message flow
+					log.info("Receiver {} is offline, handling offline message flow", receiverId);
+					handleOfflineMessage(receiverId, response, sampleMessage, senderId, timestamp);
+				} else {
+					// Receiver is online on another pod - relay via Redis
+					log.info("Receiver {} is online on another pod, publishing via Redis", receiverId);
+					messageRelayService.publish(senderId, receiverId, outboundJson);
+				}
 			}
 		} else {
 			log.warn("Invalid message payload from {}: {}", senderId, message.getPayload().toString());
@@ -180,6 +261,7 @@ public class MessageService {
 				log.warn("deliverMessage called with null target or msg (from={})", fromUserId);
 				return false;
 			}
+			log.debug("deliverMessage: msg length={} content={}", msg.length(), msg);
 
 			Optional<String> podOpt = connectionRegistryService.getConnectionPod(targetUserId);
 			if (podOpt.isEmpty()) {
@@ -220,6 +302,8 @@ public class MessageService {
 	 */
 	public void deliverRemoteMessage(String targetUserId, String msg) {
 		try {
+			log.debug("deliverMessage: msg length={} content={}", msg.length(), msg);
+
 			WebSocketSession targetSession = sessionRegistryService.getSession(targetUserId);
 			if (targetSession != null && targetSession.isOpen()) {
 				targetSession.sendMessage(new TextMessage(msg));
@@ -235,10 +319,65 @@ public class MessageService {
 	}
 
 	/**
+	 * Handles offline message delivery.
+	 * Stores the message in Redis for later retrieval and publishes sampleMessage to Kafka.
+	 * This is called when the receiver is not online.
+	 */
+	public void handleOfflineMessage(String receiverId, SendMessageResponse message, String sampleMessage, 
+									  String senderId, Long timestamp) {
+		try {
+			// Check if offline messaging is enabled at all
+			if (!offlineMessagingEnabled) {
+				log.debug("Offline messaging is disabled via offline.messaging.enabled configuration");
+				return;
+			}
+
+			if (receiverId == null || message == null) {
+				log.warn("handleOfflineMessage: Invalid inputs - receiverId={}, message={}", receiverId, message);
+				return;
+			}
+
+			log.info("Handling offline message for receiver={}, senderId={}, messageId={}", 
+					receiverId, senderId, message.getMessageId());
+
+			// 1. Store the complete message in Redis with configurable TTL for later retrieval
+			// Only if offline message storage is enabled
+			if (offlineMessageStorageEnabled) {
+				offlineMessageService.storeUndeliveredMessage(receiverId, message);
+				log.info("Stored undelivered message in Redis for receiver={}", receiverId);
+			} else {
+				log.debug("Offline message storage is disabled via offline.message.storage.enabled configuration");
+			}
+
+			// 2. Publish sampleMessage to Kafka for push notification
+			// Only if offline Kafka notifications are enabled
+			if (offlineKafkaNotificationsEnabled) {
+				if (sampleMessage != null && !sampleMessage.isEmpty()) {
+					kafkaNotificationService.publishNotification(
+							receiverId, 
+							senderId, 
+							sampleMessage, 
+							message.getMessageId(), 
+							timestamp);
+					log.info("Published notification to Kafka for receiver={}, sampleMessage length={}", 
+							receiverId, sampleMessage.length());
+				} else {
+					log.warn("handleOfflineMessage: sampleMessage is empty/null for receiver={}", receiverId);
+				}
+			} else {
+				log.debug("Offline Kafka notifications are disabled via offline.kafka.notifications.enabled configuration");
+			}
+		} catch (Exception e) {
+			log.error("Failed to handle offline message for receiver={}: {}", receiverId, e.getMessage(), e);
+		}
+	}
+
+	/**
 	 * Compute (and cache) a global hash for a user identifier. Same hash across all
 	 * receivers, deterministic & privacy-safe.
 	 */
 	private String hashUserIdentifier(String input) {
+		log.info("Hashing user identifier: {}", input);
 		if (input == null)
 			return null;
 		synchronized (hashCache) {
@@ -269,6 +408,7 @@ public class MessageService {
 	 * from repo and populate cache.
 	 */
 	private Profile getOrLoadProfile(String hashedId, String rawId) {
+		log.info("Loading profile for rawId={} (hashed={})", rawId, hashedId);
 		if (hashedId == null || rawId == null)
 			return null;
 
@@ -361,6 +501,7 @@ public class MessageService {
 	 * ==========================================================
 	 */
 	private void sendSignalJson(Map<String, Object> resp, String senderId, String receiverId) throws IOException {
+		log.debug("Signal payload keys: {}", resp.keySet());
 		String json = objectMapper.writeValueAsString(resp);
 
 		WebSocketSession session = sessionRegistryService.getSession(receiverId);
@@ -381,6 +522,8 @@ public class MessageService {
 
 		final String sessionId = root.path("sessionId").asText(null);
 		final String callType = root.path("callType").asText(null);
+
+		log.info("Received signal '{}' from {} → {} session={}", signalType, from, to, sessionId);
 
 		// --- profile details ---
 		Profile sender = null;
@@ -410,11 +553,17 @@ public class MessageService {
 		// --- SESSION HANDLING ---
 		CallSession session = (sessionId != null) ? callSessionRegistryService.getSession(sessionId) : null;
 
+		IceBuffer buf = new IceBuffer();
+
 		switch (signalType) {
 
 		case "CALL_OFFER":
 			session = callSessionRegistryService.createSession(sessionId, callType, from, to);
 			session.setCurrentState("OFFERED");
+
+			buf = iceBufferMap.computeIfAbsent(sessionId, k -> new IceBuffer());
+			buf.offerDelivered = true;
+
 			break;
 
 		case "CALL_RINGING":
@@ -423,6 +572,16 @@ public class MessageService {
 
 		case "CALL_ANSWER":
 			safeUpdateState(session, sessionId, "ANSWERED");
+
+			buf = iceBufferMap.computeIfAbsent(sessionId, k -> new IceBuffer());
+			buf.answerDelivered = true;
+
+			// Forward any buffered ICE candidates
+			for (Map<String, Object> c : buf.queuedCandidates) {
+				sendSignalJson(c, from, to);
+			}
+			buf.queuedCandidates.clear();
+
 			break;
 
 		case "CALL_CONNECTED":
@@ -445,15 +604,15 @@ public class MessageService {
 
 		case "CALL_REJECT":
 			if (safeUpdateState(session, sessionId, "REJECTED")) {
-		        resp.put("state", "REJECTED");
-		    }
+				resp.put("state", "REJECTED");
+			}
 			callSessionRegistryService.markForCleanup(sessionId);
 			break;
 
 		case "CALL_END":
 			if (safeUpdateState(session, sessionId, "ENDED")) {
-		        resp.put("state", "ENDED");
-		    }
+				resp.put("state", "ENDED");
+			}
 			callSessionRegistryService.markForCleanup(sessionId);
 			break;
 
@@ -480,6 +639,34 @@ public class MessageService {
 				resp.put("participants", session.getParticipants());
 			}
 			break;
+		case "ICE_CANDIDATE": {
+			log.warn("Buffering ICE candidate for session {} (offerDelivered={}, answerDelivered={})", sessionId,
+					buf.offerDelivered, buf.answerDelivered);
+
+			buf = iceBufferMap.computeIfAbsent(sessionId, k -> new IceBuffer());
+
+			boolean ready = buf.offerDelivered && buf.answerDelivered;
+
+			Map<String, Object> candidateMsg = new HashMap<>();
+			candidateMsg.put("signal", "ICE_CANDIDATE");
+			candidateMsg.put("from", from);
+			candidateMsg.put("to", to);
+			candidateMsg.put("sessionId", sessionId);
+			if (payload != null && !payload.isMissingNode()) {
+				candidateMsg.put("payload", payload);
+			}
+
+			if (!ready) {
+				log.warn("Buffering ICE candidate for session {} (not ready)", sessionId);
+				buf.queuedCandidates.add(candidateMsg);
+				return; // IMPORTANT: prevents sendSignalJson() from running
+			}
+			log.info("Sending ICE candidate from {} → {} for session {}", from, to, sessionId);
+
+			sendSignalJson(candidateMsg, from, to);
+			return; // IMPORTANT
+		}
+
 		}
 
 		sendSignalJson(resp, from, to);
@@ -498,6 +685,7 @@ public class MessageService {
 			return false;
 		callSessionRegistryService.updateState(sessionId, state);
 		session.setCurrentState(state);
+		log.info("Session {} state changed to {}", sessionId, state);
 		return true;
 	}
 

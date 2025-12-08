@@ -23,7 +23,7 @@ public class SendMessageResponse {
 	private String receiverId;
 	private String messageId;
 	private String actualMessage;
-	private Object file;
+	private java.util.Map<String, String> files;  // Map<fileName, base64String>
 	private Long timestamp;
     private String senderName;
     

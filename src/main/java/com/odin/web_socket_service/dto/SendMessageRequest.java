@@ -18,7 +18,9 @@ public class SendMessageRequest {
 	private String messageId;
 	private String actualMessage;
 	private String sampleMessage;
-	private Object file;
+	private java.util.Map<String, String> files;  // Map<fileName, base64String>
 	private Long timestamp;
+	private String type;
+	private String signal;
 
 }
