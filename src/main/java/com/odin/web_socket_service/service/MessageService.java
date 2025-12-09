@@ -376,7 +376,7 @@ public class MessageService {
 	 * Compute (and cache) a global hash for a user identifier. Same hash across all
 	 * receivers, deterministic & privacy-safe.
 	 */
-	private String hashUserIdentifier(String input) {
+	public String hashUserIdentifier(String input) {
 		log.info("Hashing user identifier: {}", input);
 		if (input == null)
 			return null;
@@ -407,7 +407,7 @@ public class MessageService {
 	 * Load profile using Spring Cache (cache key = hashedId). If not in cache, load
 	 * from repo and populate cache.
 	 */
-	private Profile getOrLoadProfile(String hashedId, String rawId) {
+	public Profile getOrLoadProfile(String hashedId, String rawId) {
 		log.info("Loading profile for rawId={} (hashed={})", rawId, hashedId);
 		if (hashedId == null || rawId == null)
 			return null;
