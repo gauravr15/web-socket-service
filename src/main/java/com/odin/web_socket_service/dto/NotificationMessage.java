@@ -1,11 +1,12 @@
 package com.odin.web_socket_service.dto;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.odin.web_socket_service.enums.NotificationChannel;
+
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
-import om.odin.web_socket_service.enums.NotificationChannel;
 
 import java.util.Map;
 

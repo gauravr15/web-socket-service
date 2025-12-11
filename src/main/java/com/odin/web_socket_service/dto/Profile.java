@@ -2,12 +2,13 @@ package com.odin.web_socket_service.dto;
 
 import java.sql.Timestamp;
 
+import com.odin.web_socket_service.enums.CustomerType;
+
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.ToString;
-import om.odin.web_socket_service.enums.CustomerType;
 
 @Data
 @Builder

@@ -7,10 +7,10 @@ import com.odin.web_socket_service.dto.NotificationDTO;
 import com.odin.web_socket_service.dto.Profile;
 import com.odin.web_socket_service.dto.SendMessageRequest;
 import com.odin.web_socket_service.dto.SendMessageResponse;
+import com.odin.web_socket_service.enums.NotificationChannel;
 import com.odin.web_socket_service.repo.ProfileRepository;
 import com.odin.web_socket_service.utility.NotificationUtility;
 import lombok.extern.slf4j.Slf4j;
-import om.odin.web_socket_service.enums.NotificationChannel;
 
 import org.springframework.cache.Cache;
 import org.springframework.cache.CacheManager;
@@ -55,6 +55,7 @@ public class MessageService {
 	private final ProfileRepository profileRepo;
 	private final CacheManager cacheManager; // Spring CacheManager injected
 	private final OfflineMessageService offlineMessageService;
+	private final IUndeliveredMessageService undeliveredMessageService;
 	private final KafkaNotificationService kafkaNotificationService;
 
 	@Value("${offline.messaging.enabled:true}")
@@ -71,6 +72,7 @@ public class MessageService {
 			ProfileRepository profileRepo, CacheManager cacheManager,
 			CallSessionRegistryService callSessionRegistryService,
 			OfflineMessageService offlineMessageService,
+			IUndeliveredMessageService undeliveredMessageService,
 			KafkaNotificationService kafkaNotificationService) {
 		this.messageRelayService = messageRelayService;
 		this.sessionRegistryService = sessionRegistryService;
@@ -80,6 +82,7 @@ public class MessageService {
 		this.cacheManager = cacheManager;
 		this.callSessionRegistryService = callSessionRegistryService;
 		this.offlineMessageService = offlineMessageService;
+		this.undeliveredMessageService = undeliveredMessageService;
 		this.kafkaNotificationService = kafkaNotificationService;
 	}
 
@@ -343,7 +346,7 @@ public class MessageService {
 			// 1. Store the complete message in Redis with configurable TTL for later retrieval
 			// Only if offline message storage is enabled
 			if (offlineMessageStorageEnabled) {
-				offlineMessageService.storeUndeliveredMessage(receiverId, message);
+				undeliveredMessageService.storeUndeliveredMessage(receiverId, message);
 				log.info("Stored undelivered message in Redis for receiver={}", receiverId);
 			} else {
 				log.debug("Offline message storage is disabled via offline.message.storage.enabled configuration");

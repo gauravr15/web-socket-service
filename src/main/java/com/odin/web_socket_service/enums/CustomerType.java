@@ -1,4 +1,4 @@
-package om.odin.web_socket_service.enums;
+package com.odin.web_socket_service.enums;
 
 public enum CustomerType {
 	

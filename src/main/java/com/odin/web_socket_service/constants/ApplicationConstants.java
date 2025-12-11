@@ -24,4 +24,27 @@ public class ApplicationConstants {
 	public static final String DOWNLOAD = "/download";
 	public static final String CHECK_AVAILABLE_FILES = "/check-availability";
 	
+	// Kafka Topics
+	public static final String KAFKA_UNDELIVERED_NOTIFICATION_TOPIC = "undelivered.notification.message";
+	
+	// Kafka Key Prefixes
+	public static final String KAFKA_UNDELIVERED_MESSAGE_KEY_PREFIX = "undelivered:";
+	
+	// Notification related constants
+	public static final long DEFAULT_NOTIFICATION_ID = 1L;
+	public static final String NOTIFICATION_MAP_RECEIVER_MOBILE = "receiverMobile";
+	public static final String NOTIFICATION_MAP_SENDER_MOBILE = "senderMobile";
+	public static final String NOTIFICATION_MAP_SENDER_CUSTOMER_ID = "senderCustomerId";
+	public static final String NOTIFICATION_MAP_MESSAGE = "message";
+	
+	// Message type constants
+	public static final String MESSAGE_TYPE_CHAT = "chat";
+	public static final String MESSAGE_TYPE_CALL_OFFER = "call-offer";
+	public static final String MESSAGE_TYPE_CALL_ANSWER = "call-answer";
+	public static final String MESSAGE_TYPE_ICE = "ice";
+	public static final String MESSAGE_TYPE_CALL_END = "call-end";
+	
+	// Generic message for non-text notifications
+	public static final String GENERIC_FILE_MESSAGE = "Sent a file";
+	
 }

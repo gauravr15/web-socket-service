@@ -6,7 +6,7 @@ import com.odin.web_socket_service.dto.UndeliveredMessagesResponse;
 import com.odin.web_socket_service.dto.UserStatusResponse;
 import com.odin.web_socket_service.service.ConnectionRegistryService;
 import com.odin.web_socket_service.service.MessageService;
-import com.odin.web_socket_service.service.OfflineMessageService;
+import com.odin.web_socket_service.service.IUndeliveredMessageService;
 import com.odin.web_socket_service.utility.JwtUtil;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpHeaders;
@@ -24,16 +24,16 @@ public class MessageController {
 
     private final MessageService messageService;
     private final ConnectionRegistryService connectionRegistryService;
-    private final OfflineMessageService offlineMessageService;
+    private final IUndeliveredMessageService undeliveredMessageService;
     private final JwtUtil jwtUtil;
 
     public MessageController(MessageService messageService,
                              ConnectionRegistryService connectionRegistryService,
-                             OfflineMessageService offlineMessageService,
+                             IUndeliveredMessageService undeliveredMessageService,
                              JwtUtil jwtUtil) {
         this.messageService = messageService;
         this.connectionRegistryService = connectionRegistryService;
-        this.offlineMessageService = offlineMessageService;
+        this.undeliveredMessageService = undeliveredMessageService;
         this.jwtUtil = jwtUtil;
     }
 
@@ -129,7 +129,7 @@ public class MessageController {
         log.info("getUndeliveredMessages called for userId={}", userId);
 
         try {
-            List<SendMessageResponse> messages = offlineMessageService.getUndeliveredMessages(userId);
+            List<SendMessageResponse> messages = undeliveredMessageService.getUndeliveredMessages(userId);
             
             UndeliveredMessagesResponse response = UndeliveredMessagesResponse.builder()
                     .messages(messages)
@@ -141,7 +141,7 @@ public class MessageController {
             
             // Delete messages after retrieval (they have been delivered to frontend)
             if (!messages.isEmpty()) {
-                offlineMessageService.deleteUndeliveredMessages(userId);
+                undeliveredMessageService.deleteUndeliveredMessages(userId);
                 log.info("Deleted retrieved undelivered messages for userId={}", userId);
             }
 

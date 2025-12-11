@@ -2,13 +2,14 @@ package com.odin.web_socket_service.dto;
 
 import java.util.Map;
 
+import com.odin.web_socket_service.enums.NotificationChannel;
+
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
-import om.odin.web_socket_service.enums.NotificationChannel;
 
 @Data
 @Getter

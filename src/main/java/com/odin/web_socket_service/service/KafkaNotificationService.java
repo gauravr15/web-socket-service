@@ -1,9 +1,11 @@
 package com.odin.web_socket_service.service;
 
 import com.odin.web_socket_service.dto.NotificationMessage;
+import com.odin.web_socket_service.enums.NotificationChannel;
+
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import om.odin.web_socket_service.enums.NotificationChannel;
+
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
